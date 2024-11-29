@@ -1,0 +1,1679 @@
+# -*- coding: utf-8 -*-
+
+import os
+import time
+from openai import OpenAI
+from openai import APITimeoutError
+from PyPDF2 import PdfReader
+from docx import Document
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tqdm import tqdm
+from datetime import datetime
+import json
+import tiktoken
+import tempfile
+import re  # Adicione a importação para remover caracteres inválidos
+import sys
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+import httpx
+from multiprocessing import Process
+import random
+import signal  # Adicionado para manipulação de sinais
+import logging
+import traceback
+
+
+# Configurar o cliente OpenAI
+client = OpenAI(api_key="COLOQUE SUA CHAVA API AQUI",
+                timeout=900,
+                max_retries=24)
+
+#g_idiomas = ["Português do Brasil", "English", "Español"]
+g_idiomas = ["Português do Brasil"]
+g_comecar_do_chunk = 1
+g_run_number = 0  # Estabelece tempos diferentes para diferentes linguas no resumo full
+g_resumo_full = " "
+g_inserir_resumo_global = False
+g_comprimentoDoToken = 0
+g_tokensDeEntrada = 0
+g_instrucoesEspeciais = " "
+g_divisorDeTokensDeEntrada = 0
+g_resumosAnteriores = ""
+g_resumosAnteriores2 = ""
+g_tokenMinimo = 100
+g_max_tokens_saida_2 = 2000
+g_max_tokens_saida_1 = 2000
+g_idade = 14
+
+def coletar_opcoes_iniciais(arquivos_selecionados):
+    global g_idiomas, g_divisorDeTokensDeEntrada, g_idade
+    g_idade = 14
+    publico = f"{g_idade} anos de idade ({g_idade} years old person)"
+    profissao = "Não utilizado"
+    tokens_entrada = 55000
+    max_tokens_saida_1 = 15  # 5000
+    max_tokens_saida_2 = (tokens_entrada / max_tokens_saida_1) / 2
+    incluir_cronologia = True
+    incluir_dicionário = True
+    incluir_perguntas = True
+    numero_perguntas = max_tokens_saida_2 / 100
+    incluir_analises_perspectivas = True
+    incluir_falacias = True
+    incluir_divindades = True
+    incluir_1 = True
+    incluir_2 = True
+    incluir_3 = True
+    incluir_4 = True
+    incluir_5 = True
+
+    g_divisorDeTokensDeEntrada = max_tokens_saida_1
+    global g_max_tokens_saida_1
+    g_max_tokens_saida_1 = tokens_entrada / max_tokens_saida_1
+
+    global g_max_tokens_saida_2
+    g_max_tokens_saida_2 = max_tokens_saida_2
+
+    global g_tokensDeEntrada
+    g_tokensDeEntrada = tokens_entrada
+
+    return (publico, profissao, tokens_entrada, g_max_tokens_saida_1, g_max_tokens_saida_2,
+            incluir_cronologia, incluir_perguntas, numero_perguntas, incluir_analises_perspectivas, incluir_divindades,
+            incluir_dicionário, incluir_falacias, incluir_1, incluir_2, incluir_3, incluir_4, incluir_5)
+
+# Inicializa a variável global corretamente
+coletar_opcoes_iniciais(None)
+
+
+def handle_signal(signum, frame):
+    print(f"\nSinal {signum} recebido. Salvando progresso e encerrando.")
+    sys.exit(0)
+
+
+# Registrar os manipuladores de sinal
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
+
+
+# Definir uma exceção personalizada se necessário
+@retry(
+    wait=wait_exponential(multiplier=3, min=60, max=7200),
+    stop=stop_after_attempt(20),
+    retry=retry_if_exception_type((APITimeoutError, httpx.TimeoutException, httpx.RequestError))
+)
+def dividir_texto_por_tokens(texto_completo, tokens_por_chunk, modelo="gpt-4o-mini"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"{timestamp} - Dividindo tokens por chunks de tamanho {tokens_por_chunk}")
+
+    # Inicializando o tokenizer de acordo com o modelo
+    encoding = tiktoken.encoding_for_model(modelo)
+
+    # Convertendo o texto em uma lista de tokens
+    tokens = encoding.encode(texto_completo)
+    global g_comprimentoDoToken
+    g_comprimentoDoToken = len(tokens)
+    print(f"Tamanho total dos Tokens: {g_comprimentoDoToken}")
+
+    # Lista para armazenar informações dos chunks
+    chunk_info = []
+
+    # Dividindo a lista de tokens em chunks
+    chunks = []
+    for i in range(0, len(tokens), tokens_por_chunk):
+        chunk = tokens[i:i + tokens_por_chunk]
+        chunks.append(chunk)
+        chunk_info.append(f"Chunk {len(chunks)}: {len(chunk)} tokens")
+
+    # Imprimindo todas as informações dos chunks na mesma linha, separadas por vírgulas
+    print(", ".join(chunk_info))
+
+    # Decodificando os tokens de volta para texto para cada chunk
+    chunks_de_texto = []
+    for idx, chunk in enumerate(chunks, start=1):
+        texto_chunk = encoding.decode(chunk)
+        chunks_de_texto.append(texto_chunk)
+
+    return chunks_de_texto
+
+
+def calcular_tokens(texto, modelo="gpt-4o-mini"):
+    # Carrega o codificador de tokens do modelo especificado
+    codificador = tiktoken.encoding_for_model(modelo)
+    # Codifica a string em tokens e retorna o número total
+    return len(codificador.encode(texto))
+
+
+def contar_chunks_usando_divisao(texto_completo, tokens_por_chunk=20000, modelo="gpt-4o-mini"):
+    # Reutilizando a função que já divide o texto
+    chunks = dividir_texto_por_tokens(texto_completo, tokens_por_chunk, modelo)
+
+    # O número total de chunks é simplesmente o tamanho da lista de chunks
+    num_chunks_128 = len(chunks)
+
+    return num_chunks_128
+
+
+def limpar_nome_arquivo(nome):
+    # Substituir caracteres inválidos por underscore ou remover
+    return re.sub(r'[<>:"/\\|?*]', '_', nome)
+
+
+def criar_arquivo_temporario():
+    # Criar um arquivo temporário que será excluído ao final do script
+    temp_file = tempfile.NamedTemporaryFile(delete=False, mode='w+')
+    return temp_file.name
+
+
+def salvar_resultado_temporario_imagem(resultado, caminho_arquivo_temp):
+    with open(caminho_arquivo_temp, 'a') as arquivo_temp:
+        arquivo_temp.write(resultado + '\n')
+
+
+def salvar_resultado_temporario_divindades(resultado, caminho_arquivo_temp):
+    with open(caminho_arquivo_temp, 'a') as arquivo_temp:
+        arquivo_temp.write(resultado + '\n')
+
+
+def ler_resultados_temporarios(caminho_arquivo_temp):
+    if os.path.exists(caminho_arquivo_temp):
+        with open(caminho_arquivo_temp, 'r') as arquivo_temp:
+            return arquivo_temp.read()
+    return ""
+
+
+def ler_arquivo_base(nome_base):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    nome_arquivo = f"{nome_base}.txt"  # Adiciona a extensão '.txt'
+    caminho_arquivo = os.path.join(os.path.dirname(__file__), nome_arquivo)
+
+    try:
+        # Tenta ler com UTF-8
+        with open(caminho_arquivo, 'r', encoding='utf-8') as file:
+            conteudo = file.read()
+        return conteudo
+    except UnicodeDecodeError:
+        try:
+            # Tenta com latin-1 caso UTF-8 falhe
+            with open(caminho_arquivo, 'r', encoding='latin-1') as file:
+                conteudo = file.read()
+                print(f"Conteúdo de {nome_base}.txt lido com sucesso.")
+            return conteudo
+        except Exception as e:
+            print(f"{timestamp} - Erro ao ler '{nome_arquivo}' com encoding 'latin-1': {e}")
+            return ""
+    except FileNotFoundError:
+        print(f"Erro: O arquivo '{nome_arquivo}' não foi encontrado no diretório do script.")
+        return ""
+    except Exception as e:
+        print(f"{timestamp} - Erro ao ler '{nome_arquivo}': {e}")
+        return ""
+
+
+def salvar_progresso(progresso, caminho_arquivo):
+    with open(caminho_arquivo, 'w') as arquivo:
+        json.dump(progresso, arquivo)
+
+
+def carregar_progresso(caminho_arquivo):
+    if os.path.exists(caminho_arquivo):
+        with open(caminho_arquivo, 'r') as arquivo:
+            return json.load(arquivo)
+    return None
+
+
+def perguntar_continuar(idioma, progresso2, progresso3):
+    import tkinter as tk
+    from tkinter import messagebox
+
+    arquivo = progresso2
+    chunk = progresso3
+
+    root = tk.Tk()
+    root.withdraw()  # Esconde a janela principal
+    # resposta = messagebox.askyesno("Retomar Processamento", "Há um progresso salvo em idioma_atual. Deseja continuar de onde parou?")
+    resposta = messagebox.askyesno(title=f"{idioma}: Retomar Processamento interrompido",
+                                   message=f"Há um progresso salvo. Deseja continuar de onde parou?"
+                                           f"\n Arquivo: {arquivo}. "
+                                           f"\n Chunk: {chunk}")
+    return resposta
+
+
+def escolher_arquivos():
+    root = tk.Tk()
+    root.withdraw()
+    caminhos_arquivos = filedialog.askopenfilenames(filetypes=[("Documentos", "*.pdf;*.doc;*.docx")])
+    return sorted(caminhos_arquivos)
+
+
+def criar_janela_selecao(titulo, opcoes):
+    def on_select():
+        selecao = dropdown.get()
+        root.quit()
+
+    root = tk.Tk()
+    root.title(titulo)
+    root.geometry("430x300")  # Aumentar a altura da janela para acomodar o novo dropdown
+
+    label = tk.Label(root, text="Escolha uma opção:")
+    label.pack(pady=10)
+
+    selecao = tk.StringVar()
+    dropdown = ttk.Combobox(root, textvariable=selecao, values=opcoes, state="readonly")
+    dropdown.pack(pady=10)
+    dropdown.set(opcoes[0])  # Valor padrão
+
+    botao = tk.Button(root, text="Confirmar", command=on_select)
+    botao.pack(pady=10)
+
+    root.mainloop()
+    root.destroy()
+    return selecao.get()
+
+
+def ler_arquivo(caminho, inicio_texto=None, fim_texto=None):
+    _, extensao = os.path.splitext(caminho)
+    if extensao.lower() == '.pdf':
+        with open(caminho, 'rb') as arquivo:
+            leitor = PdfReader(arquivo)
+            texto_completo = ' '.join([leitor.pages[i].extract_text() for i in range(len(leitor.pages))])
+
+            if inicio_texto and inicio_texto in texto_completo:
+                texto_completo = texto_completo.split(inicio_texto, 1)[1]
+            if fim_texto and fim_texto in texto_completo:
+                texto_completo = texto_completo.split(fim_texto, 1)[0]
+
+            return texto_completo
+    elif extensao.lower() in ['.doc', '.docx']:
+        doc = Document(caminho)
+        texto_completo = ' '.join([paragrafo.text for paragrafo in doc.paragraphs])
+
+        if inicio_texto and inicio_texto in texto_completo:
+            texto_completo = texto_completo.split(inicio_texto, 1)[1]
+        if fim_texto and fim_texto in texto_completo:
+            texto_completo = texto_completo.split(fim_texto, 1)[0]
+
+        return texto_completo
+
+
+g_attemp_after_error = 0
+g_rodada = 0
+
+
+def enviador(idioma_atual, prompt="None", system="None", temperature=0.1, max_tokens=g_max_tokens_saida_1,
+             model="gpt-4o-mini"):
+    global g_comprimentoDoToken
+    global g_tokenMinimo
+    global g_max_tokens_saida_1
+    g_tokenMinimo = 100
+
+    if max_tokens == 0 or max_tokens is None:
+        max_tokens = g_max_tokens_saida_1
+
+    if prompt == "None" or system == "None" or idioma_atual == "None":
+        raise ValueError("Os parâmetros 'prompt' e 'system' são obrigatórios e não podem ser 'None'.")
+
+    if g_comprimentoDoToken > g_tokenMinimo:
+        global g_attemp_after_error
+        instrucoes = " "
+        if idioma_atual == "Português do Brasil":
+            instrucoes = (
+                f"Escreva até {max_tokens} tokens em português do Brasil de forma objetiva, direta, concisa e imparcial, usando a terceira pessoa do plural. "
+                f"Adira estritamente à fonte fornecida. "
+                f"Em diálogos ou relatos pessoais, escreva em terceira pessoa, como observador externo. "
+                f"Não insira informações sobre procedimentos internos ou comunique necessidades ou desafios internos."
+                f"Não inclua introduções, comentários pessoais, expressões coloquiais, saudações ou informações de outras fontes. "
+                "Evite copiar frases exatas e abreviações. "
+                "Ignore seções de perguntas e respostas, assim como listas bibliográficas ou de referências."
+                f"Não insira no texto final as instruções que recebeu, nem mostre o número de tokens limite. "
+                "Evite direcionar o texto ao leitor, não utilize pronomes como 'você', 'vocês', 'seja motivado', etc."
+                f"Escreva {max_tokens - 10} tokens. "
+                f"Garanta que a última frase não termina abruptamente. "
+                f"Tenha certeza de que o idioma inteiro do texto produzido está em português do Brasil.")
+        elif idioma_atual == "English":
+            instrucoes = (
+                f"Write up to {max_tokens} tokens in english in an objective, direct, concise, and impartial manner, using the third person plural. "
+                f"Strictly adhere to the provided source. "
+                f"In dialogues or personal accounts, write in the third person, as an external observer. "
+                f"Do not insert information about internal procedures or communicate internal needs or challenges."
+                f"Do not include introductions, personal comments, colloquial expressions, greetings, or information from other sources. "
+                "Avoid copying exact sentences and abbreviations. "
+                "Ignore question and answer sections, as well as bibliographic or reference lists."
+                f"Do not insert the instructions you received into the final text, nor show the token limit number. "
+                "Avoid directing the text to the reader; do not use pronouns like 'you', 'you all', 'be motivated', etc."
+                f"Write {max_tokens - 10} tokens. "
+                f"Ensure that the last sentence does not end abruptly. "
+                f"Make sure that the entire language of the produced text is in English. "
+            )
+        elif idioma_atual == "Español":
+            instrucoes = (
+                f"Escribe hasta {max_tokens} tokens en español de manera objetiva, directa, concisa e imparcial, usando la tercera persona del plural. "
+                f"Adhiérete estrictamente a la fuente proporcionada. "
+                f"En diálogos o relatos personales, escribe en tercera persona, como observador externo. "
+                f"No insertes información sobre procedimientos internos ni comuniques necesidades o desafíos internos."
+                f"No incluyas introducciones, comentarios personales, expresiones coloquiales, saludos ni información de otras fuentes. "
+                "Evita copiar frases exactas y abreviaturas. "
+                "Ignora secciones de preguntas y respuestas, así como listas bibliográficas o de referencias."
+                f"No insertes en el texto final las instrucciones que recibiste, ni muestres el número de tokens límite. "
+                "Evita dirigir el texto al lector, no utilices pronombres como 'tú', 'ustedes', 'sé motivado', etc."
+                f"Escribe {max_tokens - 10} tokens. "
+                f"Asegúrese de que la última frase no termine abruptamente. "
+                f"Asegúrese de que todo el idioma del texto producido esté en español"
+            )
+        else:
+            print("ERRO de IDIOMA")
+
+        try:
+            system_envio = f"Independente do idioma das instruções a seguir, escreva no idioma: {idioma_atual}. {system}. {instrucoes}"
+            prompt_envio = f"Independente do idioma das instruções a seguir, escreva no idioma: {idioma_atual}. {prompt}. {instrucoes}"
+            resposta = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    {"role": "system",
+                     "content": system_envio},
+                    {"role": "user",
+                     "content": prompt_envio}
+                ],
+                max_tokens=int(max_tokens)
+            )
+            return resposta.choices[0].message.content
+
+
+        except (APITimeoutError, httpx.ReadTimeout, httpx.RequestError) as e:
+
+            print("Timeout ao tentar se comunicar com a API da OpenAI. Tentando novamente")
+            g_attemp_after_error += 1
+            print(f"Tentativa {g_attemp_after_error} de se comunicar com a API da OpenAI")
+            # Opcional: implementar lógica de retry aqui ou usar decoradores como tenacity
+            raise e  # Re-levanta a exceção original
+    raise ValueError(f"Trecho sem conteúdo ou conteúdo menor que {g_tokenMinimo} tokens")
+
+
+def resumir_titulo(info, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas, numero_perguntas,
+                   idioma_atual):
+    temp_tokens = 20
+    prompt = (f"Crie um título conciso em {temp_tokens} tokens usando como base estas informações: {info} "
+              )
+    system = (
+        "Você é um assistente especializado em criar títulos para capítulos de livros, "
+        "tanto acadêmicos quanto de literatura. "
+        "Você inicia sua escrita com: ' <silence msec=\"2000\"/> ' "
+
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.5, max_tokens=temp_tokens)
+
+
+def resumir_para_imagem(info, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas, numero_perguntas,
+                        caminho_arquivo_temp, idioma_atual):
+    temp_tokens = 30
+
+    # Ler os resultados anteriores do arquivo temporário
+    global g_resumosAnteriores
+    prompt = (
+        f"Escreva o resultado inteiro no idioma: {idioma_atual}."
+        f"Descreva, usando até {temp_tokens} tokens, uma pintura em tela que represente o conteúdo do seguinte texto. "
+        f"Crie uma pintura a óleo baseada mais em ambientes do que em pessoas ou abstrações. "
+        f"Evite representações muito abstratas que seriam impossíveis de existirem no mundo real. "
+        f"Fale sobre: as cores usadas, o ambiente da cena. "
+        f"Comece o texto com: '<silence msec=\"2000\"/> Imagem mental: ' "
+        f"Termine o texto com: '<silence msec=\"2000\"/> '"
+        f"Escreva no idioma:  {idioma_atual}. "
+        f"Este é o texto fonte a ser trabalhado:{info}"
+    )
+    system = (
+        f"Eu preciso que você transforme a essência do texto recebido em uma pintura em tela. "
+        f"Deixe sua expressividade fluir, o objetivo é capturar o conteúdo do texto o máximo possível "
+        f"em uma imagem (descrição) emocionalmente impactante, para que a pessoa que a imaginar possa visualizá-la facilmente "
+        f"em sua mente e, mais importante, associá-la ao conteúdo em que se baseia. "
+        f"Você não escreve nenhuma informação sobre procedimentos internos, limitações, ou por que fará algo. "
+        f"Voc^escreve em {idioma_atual}. "
+        f"Garanta que a descrição seja muito diferente dessas descrições geradas anteriormente:{g_resumosAnteriores}"
+    )
+    g_resumosAnteriores = enviador(idioma_atual, prompt, system, 0.5, max_tokens=temp_tokens)
+    return g_resumosAnteriores
+
+
+def resumir_info_full(info, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas, numero_perguntas,
+                      idioma_atual, incluir_dicionario):
+    chunks_number = contar_chunks_usando_divisao(info)
+
+    global g_run_number
+    g_run_number += 1
+    sleep1 = 0  # random.randint(2, 5)
+    sleep2 = 0  # random.randint(1, 2)
+    if g_run_number <= 40:
+        print(f"Execução {g_run_number}: sem espera. ")
+    elif g_run_number == 41:
+        print(f"Execução {g_run_number}: esperando {sleep1} ")
+        time.sleep(sleep1)
+    else:
+        print(f"Execução {g_run_number}: esperando {sleep2} ")
+        time.sleep(sleep2)
+
+    tokens_limite = 250
+
+    prompt = (
+        f"O seguinte texto será resumido em {idioma_atual} para ser lido por {target}. "
+        "Preserve todos os conceitos, números, nomes, locais e datas. "
+        "Ignore as seções com perguntas e respostas, se houver. "
+        f" Escreva em {tokens_limite} tokens, talvez 10 tokens a mais ou a menos. "
+        f"Certifique-se de que o texto não termine abruptamente. "
+        f"Jamais diga 'era uma vez'. "
+        f"Jamais fale em primeira pessoa ou use 'eu'. "
+        f"{g_instrucoesEspeciais}"
+        f" O texto a ser trabalhado é este: {info})."
+    )
+    system = (
+        "Você é um assistente que resume textos de livros de forma objetiva e impessoal em "
+        f"{idioma_atual}. Parafraseie o conteúdo original, garantindo que o resultado final "
+        "seja pelo menos 50% diferente para evitar reclamações de direitos autorais. Preserve "
+        "conceitos, números (escreva por extenso), nomes, locais e datas. Não inclua introduções, "
+        "comentários pessoais, expressões coloquiais, saudações ou informações de outras fontes. "
+        "Jamais fale em primeira pessoa ou use 'eu'."
+        f"Escreva no idioma: {idioma_atual}. "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2)
+
+
+def resumir_info(info, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas, numero_perguntas,
+                 idioma_atual, resumo_anterior=None):
+    global g_tokensDeEntrada
+    global g_comprimentoDoToken
+    global g_divisorDeTokensDeEntrada
+    global g_idade
+    global g_instrucoesEspeciais
+
+    tokensDeEntrada = g_tokensDeEntrada
+    comprimentoDoToken = g_comprimentoDoToken
+    divisorDeTokensDeEntrada = g_divisorDeTokensDeEntrada
+    idade = g_idade
+    instrucoesEspeciais = g_instrucoesEspeciais
+
+    temperature = 0.15
+    especial = 1
+    divisor = 5
+    maximoDeTokens = max_tokens_saida_1
+    tokensRestantes = 0
+    alvo = target
+    resultadoConcatenado = ""
+    last_chunk_chars = ""
+
+    if comprimentoDoToken < max_tokens_saida_1 * divisor:
+        maximoDeTokens = int(comprimentoDoToken / divisor)
+
+    total_tokens_info = calcular_tokens(info)
+
+    #verifica se o envio é maior de 5000 tokens, o que gera resultado sempre curto (até 600 tokens)
+    if total_tokens_info > 5000:
+        if resumo_anterior:
+            calculadorDeTokens = calcular_tokens(resumo_anterior) + calcular_tokens(info)
+            maximoDeTokens_temp = calculadorDeTokens/ divisorDeTokensDeEntrada
+            chunks_info = dividir_texto_por_tokens(resumo_anterior + info, 5000)
+        else:
+            calculadorDeTokens = calcular_tokens(info)
+            maximoDeTokens = calculadorDeTokens / divisorDeTokensDeEntrada
+            chunks_info = dividir_texto_por_tokens(info, 5000)
+    else:
+        if resumo_anterior:
+            tudoJunto = resumo_anterior + ". " + info
+            chunks_info = [tudoJunto]
+        else:
+            chunks_info = [info]
+
+    primeiro_chunk = True
+    for chunk in chunks_info:
+        chunk_adicional = ""
+
+        if not primeiro_chunk:
+            chunk_adicional = last_chunk_chars
+        else:
+            # Para o primeiro chunk, não adiciona nada
+            chunk_adicional = ""
+            primeiro_chunk = False  # Atualiza o indicador após o primeiro chunk
+
+        # funciona para curtos (ok) e não curtos (não ok e precisam ser imendados)
+        prompt = (
+            f"O seguinte texto deve ser resumido em {idioma_atual} para que seja lido preferencialmente por {alvo} e "
+            f"escrito em mais de {maximoDeTokens + especial} tokens. "
+            f"Insira diversos exemplos e detalhes que sejam fiéis ao texto original. "
+            "Preserve todos os conceitos, números, nomes, locais e datas. "
+            "Ignore as seções com perguntas e respostas, se houver. "
+            f"{instrucoesEspeciais}"
+            "Transforme qualquer relato ou discurso em primeira pessoa em versão em terceira pessoa, como observador externo. "
+            f"Parafraseie o conteúdo original, garantindo que o resultado final seja pelo menos 85% diferente para evitar "
+            f"reclamações de direitos autorais. "
+            f"Jamais diga 'era uma vez' ou fale na primeira pessoa ou diga 'eu'. "
+            f"O texto a ser trabalhado é este: {chunk_adicional} {chunk}"
+        )
+        system = (
+            f"Você é um assistente que resume textos de livros de forma objetiva e impessoal em {idioma_atual}. "
+            f"Parafraseie o conteúdo original, garantindo que o resultado final seja pelo menos 65% diferente para evitar "
+            f"reclamações de direitos autorais. "
+            f"Preserve conceitos, números (escreva por extenso), nomes, locais e datas. "
+            f"Jamais fale na primeira pessoa ou diga 'eu'. "
+            f"Escreva no idioma: {idioma_atual} cerca de {maximoDeTokens + especial} tokens. "
+        )
+
+        resultadoFinal_1 = enviador(idioma_atual, prompt, system, temperature, max_tokens=maximoDeTokens + especial)
+        resultadoFinal_2 = ""
+        tokensResultadoFinal = calcular_tokens(resultadoFinal_1)
+
+        idadeOriginal = idade
+        rodada = 0
+        # reenvia o prompt se o resultado for curto demais
+        while tokensResultadoFinal < max_tokens_saida_1 / 10 and rodada <= 4:
+            alvo = f"{idade + 1} anos de idade ({idade + 1} years old person)"
+            resultadoFinal_1 = enviador(idioma_atual, prompt, system, temperature + 0.05,
+                                        max_tokens=maximoDeTokens + especial)
+            tokensResultadoFinal = calcular_tokens(resultadoFinal_1)
+            rodada += 1
+            print(f"Resultado menor que {max_tokens_saida_1 / 10} tokens: aumentando idade para {idade} na rodada {rodada} ")
+            if idade >= 26:
+                idade = idadeOriginal
+
+        tokensRestantes = (maximoDeTokens + especial) - tokensResultadoFinal
+        tokensRestantes = max(tokensRestantes, 300)  # Garante no mínimo 300 tokens
+        tokensRestantes = min(tokensRestantes, maximoDeTokens + especial)  # Define um limite superior se necessário
+
+        # adiciona texto especial a um resultado muito curto
+        if tokensResultadoFinal < (maximoDeTokens + especial) / 1.5:
+            print(
+                f"   --- Reenviando porque resultado veio curto demais. Resultado veio com {tokensResultadoFinal} e deveria "
+                f"ter vindo com {(maximoDeTokens + especial) / 1.5}  --- Gerando resultado adicional com {tokensRestantes} tokens novos em {idioma_atual}.")
+
+            prompt_adicional = (
+                f"Faça uma explicação detalhada e com exemplos do conteúdo do texto original em {tokensRestantes} tokens, no idioma "
+                f"{idioma_atual} e adaptada para ser lida por {alvo}. "
+                "Transforme qualquer relato ou discurso em primeira pessoa em versão em terceira pessoa, como observador externo. "
+                f"Jamais diga 'era uma vez' ou fale na primeira pessoa ou diga 'eu'. "
+                f"O texto a ser trabalhado é este: {chunk}. "
+            )
+            system_adicional = (
+                f"Você é um assistente que resume textos de livros de forma objetiva e impessoal em {idioma_atual}. "
+                f"Preserve conceitos, números (escreva por extenso), nomes, locais e datas. "
+                f"Jamais fale na primeira pessoa ou diga 'eu'. "
+                f"Escreva no idioma {idioma_atual} mais de {tokensRestantes} tokens. "
+            )
+
+            temporario = enviador(idioma_atual, prompt_adicional, system_adicional, temperature,
+                                  max_tokens=tokensRestantes)
+            resultadoFinal_2 = (f"\n\n Interpretação adicional: \n" if idioma_atual == "Português do Brasil"
+                                else f"\n\n Additional Interpretation: \n" if idioma_atual == "English"
+            else f"\n\n Interpretación Adicional: \n" if idioma_atual == "Español" else "")
+            resultadoFinal_2 += temporario
+        else:
+            resultadoFinal_2 = ""
+
+        #junta o resultado final 1 com (eventual) resultado complementar 2
+        resultadoFinal = resultadoFinal_1 + ". " + resultadoFinal_2
+
+        # adiciona parte do resultado anterior na última versão do resultado atual (se for o caso)
+        max_last_chars = 3000  # Define o número máximo de caracteres a armazenar
+        last_chunk_chars = resultadoFinal[-max_last_chars:]
+
+        # vai juntando os resultados diferentes (se for o caso) em um só. Se for um único resultado ele será o único.
+        resultadoConcatenado += resultadoFinal + "\n"
+
+    return resultadoConcatenado
+
+
+def resumir_resumo_info(info, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas, numero_perguntas,
+                 idioma_atual):
+    temp_tokens = int(max_tokens_saida_1 / 10)
+    temperature = 0.2
+
+    prompt = (
+        f"O seguinte texto deve ser reduzido ao essencial em {idioma_atual} e "
+        f"escrito em no máximo {temp_tokens} tokens. "
+        "Preserve todos os conceitos, números, nomes, locais e datas. "
+        f"Jamais diga 'era uma vez' ou fale na primeira pessoa ou diga 'eu'. "
+        f"O texto a ser trabalhado é este: {info}"
+    )
+    system = (
+        f"Você é um assistente que resume textos de livros de forma objetiva e impessoal em {idioma_atual}. "
+        f"Preserve conceitos, números (escreva por extenso), nomes, locais e datas. "
+        f"Jamais fale na primeira pessoa ou diga 'eu'. "
+        f"Escreva no idioma: {idioma_atual} cerca de {temp_tokens} tokens. "
+    )
+
+    return enviador(idioma_atual, prompt, system, temperature, max_tokens=temp_tokens)
+
+def fazer_dicionario(info, max_tokens_saida_1, idioma_atual):
+    global g_resumo_full
+    temp_tokens = 50
+    maximo = max_tokens_saida_1 / 3
+
+    prompt = (
+        f"Exclusivamente se o texto fonte tiver conceitos totalmente explicados, crie um dicionário de termos listando-os "
+        f"e os explicando em {temp_tokens} tokens cada. "
+        f"Escreva no máximo {maximo} tokens. "
+        f"A única informação apresentada deve ser o dicionário de termos. "
+        f"O dicionário de termos deve seguir o padrão: '- Termo: Significado'."
+        "Não use nenhuma ideia além da que está presente no texto. Se houver dúvida sobre o significado de algum termo, "
+        "exclua aquele termo."
+        f"Escreva no idioma: {idioma_atual}. "
+        f"O texto a ser analisado é este: {info}"
+    )
+
+    system = (
+        "Você é um assistente especializado em criar dicionário de termos. "
+        f"O dicionário de termos deve seguir o padrão: 'Termo: Significado'. "
+        f"Escreva em no máximo {maximo} tokens."
+
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.1, max_tokens=maximo)
+
+
+def fazer_cronologia(info, max_tokens_saida_2, idioma_atual):
+    temp_tokens = 30
+    prompt = (
+        "Se alguma data (o ano é obrigatório) estiver presente no texto fonte, adicione uma cronologia. "
+        "Organize em ordem cronológica do mais antigo para o mais recente. "
+        "Você escreve apenas a cronologia no formato: 'Data: Evento.' "
+        "Agrupe eventos que tenham datas idênicas dentro de um mesmo parágrafo. "
+        f"Escreva cada item em no máximo {temp_tokens} tokens. "
+        f"Escreva o máximo de {max_tokens_saida_2} tokens."
+        f"O texto a ser trabalhado é este: {info}. "
+    )
+    system = (
+        "Você é um assistente especializado em criar cronologias de eventos. "
+        "Você só cria a cronologia se houver uma data explícita, incluindo o ano do evento."
+        "Organize em ordem cronológica do mais antigo para o mais recente. "
+        "Agrupe eventos que tenham datas idênicas dentro de um mesmo parágrafo. "
+        "Você escreve apenas a cronologia no formato: 'Data: Evento.'"
+        "Você organiza as linhas em ordem cronológica do mais antigo para o mais recente. "
+        f"Escreva no máximo {max_tokens_saida_2}"
+    )
+
+    resultadoFinal = enviador(idioma_atual, prompt, system, 0.2, max_tokens=max_tokens_saida_2)
+
+    prompt_2 = (
+        "Organize em ordem cronológica do mais antigo para o mais recente. "
+        "Agrupe eventos que tenham datas idênicas dentro de um mesmo parágrafo. "
+        f"O texto a ser trabalhado é: {resultadoFinal}"
+    )
+    system_2 = (
+        "Você é um assistente especializado em criar cronologias de eventos. "
+        "Você escreve apenas a cronologia no formato: 'Data: Evento.'"
+        "Você organiza as linhas em ordem cronológica do mais antigo para o mais recente. "
+        f"Escreva no máximo {max_tokens_saida_2} tokens."
+    )
+
+    # return enviador(idioma_atual, prompt_2, system_2, 0.1, max_tokens=max_tokens_saida_2, model="gpt-4o")
+    return resultadoFinal
+
+
+def fazer_perguntas(info, numero_perguntas, idioma_atual):
+    # global g_comprimentoDoToken
+    global g_tokensDeEntrada, g_comprimentoDoToken, g_max_tokens_saida_2
+
+    maximoDePerguntas = g_comprimentoDoToken / 100
+    numero_perguntas = min(numero_perguntas, maximoDePerguntas)
+    if numero_perguntas < 2:
+        numero_perguntas = 2
+    if numero_perguntas > 50:
+        numero_perguntas = 50
+
+    prompt = (
+        f"Crie {numero_perguntas} perguntas de sim ou não baseadas no conteúdo, onde antes de cada "
+        f"pergunta deve dizer 'Responda à pergunta:' e após cada pergunta deve haver uma resposta "
+        f"de aproximadamente 50 palavras. "
+        f"Antes de escrever a resposta você escreve: ' <silence msec=\"2000\"/> '"
+        f"O discurso deve ser direto, objetivo, e jamais na primeira pessoa. "
+        f"Você escreve em em {idioma_atual}. "
+        "O texto deve ser direto, objetivo, e jamais na primeira pessoa. "
+        "Não faça qualquer resumo antes de colocar as perguntas. "
+        f"O texto a ser trabalhado é este: {info}"
+    )
+    system = (
+        "Você é um assistente especializado em resumir conteúdo de livros, tanto acadêmicos quanto de literatura. "
+        f"Você escreve em {idioma_atual} "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=g_max_tokens_saida_2)
+
+
+def falacia_logica(fonte, target, max_tokens_saida_2, idioma_atual, chunk_size):
+    # print("Acessando a função: falácias lógicas PT/ENG.")
+    temp_tokens = 300  # Aumentei os tokens para acomodar explicações
+
+    prompt = (
+        f"Faça uma análise em {idioma_atual} adaptada preferencialmente para {target} identificando apenas falácias lógicas no texto: {fonte}. "
+        f"Para cada falácia encontrada, explique como ela ocorreu e como identificá-la no futuro. "
+        f"Se não houver falácias lógicas, indique que não há falácias no trecho analisado. "
+        f"Escreva cerca de {temp_tokens} tokens."
+    )
+    system = (
+        "Você pensa como um acadêmico. "
+        "Você não escreve nenhuma informação sobre procedimentos internos, limitações, "
+        "ou por que você fará algo. "
+        "Você não diz quem é o público alvo do que escreve e nem faz reflexões sobre ele. "
+        "Você evita usar abreviações. "
+        "Você adere estritamente ao texto original. "
+        f"Você escreve em {idioma_atual} "
+        "Concentre-se apenas em identificar falácias lógicas no texto. "
+        "Para cada falácia encontrada, forneça uma explicação de como ela ocorreu e como identificá-la no futuro. "
+        "Se não houver falácias lógicas, informe que não há falácias no trecho analisado."
+        f"Escreva cerca de {temp_tokens} tokens."
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.1, max_tokens=max_tokens_saida_2)
+
+
+def gerar_pensadores(info, target, idioma_atual, pensadores):
+    tokens_maximos = 500
+
+    prompt = (
+        f"Escreva opiniões de 3 pensadores clássicos mundiais que tratem de temas similares aos do texto fonte. "
+        f"A lista de onde devem ser escolhidos os pensadores é: {pensadores}"
+        "Certifique-se de que as opiniões sejam críticas a respeito do texto fonte. "
+        f"Escreva adaptando o discurso preferencialmente para {target} em no máximo {tokens_maximos}. "
+        f"O texto fonte é: {info} "
+
+    )
+    system = (
+        "Você é um especialista que irá apresentar as opiniões dos 3 pensadores que mais podem influenciar criticamente a discussão sobre o tema fornecido. "
+        "As opiniões devem ser críticas e refletir o pensamento dos pensadores escolhidos. "
+        "Não inclua introduções, comentários pessoais, expressões coloquiais, saudações ou informações de outras fontes. "
+        f"Escreva no idioma: {idioma_atual}. "
+        f"Limite o texto a {tokens_maximos} tokens. "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=tokens_maximos)
+
+
+def analise_dialetica(info, target, idioma_atual):
+    tokens_maximos = 500
+
+    prompt = (
+        f"Faça uma análise dialética em {idioma_atual} do conteúdo '[{info}]', apresentando tese, antítese e síntese. "
+        f"Adapte o discurso preferencialmente para {target} em no máximo {tokens_maximos} tokens, talvez 10 tokens a mais ou a menos. "
+        "Certifique-se de que o texto não termine abruptamente."
+    )
+    system = (
+        "Você é um especialista que realizará uma análise dialética do conteúdo fornecido, apresentando tese, antítese e síntese. "
+        "Não inclua introduções, comentários pessoais, expressões coloquiais, saudações ou informações de outras fontes. "
+        f"Escreva no idioma: {idioma_atual} "
+        "Limite o texto ao máximo de tokens especificado. "
+        "Certifique-se de que o texto seja coerente e fluido, sem terminar abruptamente."
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=tokens_maximos)
+
+
+def esfinge(info, idioma_atual):
+    tokens_maximos = 100
+
+    prompt = (
+        f"Você é a Esfinge histórica do Egito e do mito de Édipo que escreve em {idioma_atual}. "
+        f"Crie uma pergunta profunda e enigmática sobre o tema '[{info}]'. "
+        f"A pergunta deve ter no máximo {tokens_maximos} tokens. "
+        "Certifique-se de que a pergunta seja enigmática e provoque reflexão. "
+        "Não diga a resposta."
+    )
+    system = (
+        "Você é a Esfinge histórica do Egito e do mito de Édipo, famosa por fazer perguntas enigmáticas e desafiadoras. "
+        "Crie uma pergunta que provoque reflexão profunda e esteja relacionada ao tema fornecido. "
+        "Não inclua introduções, comentários pessoais, expressões coloquiais ou saudações. "
+        f"Escreva no idioma: {idioma_atual} e mantenha a pergunta dentro do limite de tokens especificado."
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.5, max_tokens=tokens_maximos)
+
+
+def escolas_do_pensamento(resumo, target, max_tokens_saida_2, idioma_atual, chunk_size, chunk):
+    temp_tokens = max_tokens_saida_2 / 15
+    fonte = chunk
+
+    prompt = (
+        f"Faça análises em {idioma_atual} adaptadas preferencialmente para {target}, fundamentadas no pensamento das "
+        f"escolas do pensamento: "
+        f"Em {temp_tokens * 2} tokens, analise o conteúdo do texto fonte com base nas metodologias socrática e hegeliana. "
+        f"Em {temp_tokens * 5} tokens, verifique quais das metodologias a seguir foram aplicados na análise e qual método geraria "
+        f"resultado significativamente diferente: método dedutivo, método indutivo, método hermenêutico, método empírico, "
+        f"método analítico, método histórico, método comparativo, método dialógico e método fenomenológico. "
+        f"Em {temp_tokens} tokens, analise o conteúdo do texto fonte com base nas metodologias tântrica e da yoga. "
+        f"O texto fonte a ser analisado é: {resumo}."
+    )
+    system = (
+        "Você pensa e escreve como um acadêmico com doutorado. "
+        f"Você escreve em {idioma_atual}. "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.5, max_tokens=temp_tokens)
+
+
+def perspectivas_jung(info, target, max_tokens_saida_2, jung, idioma_atual):
+    temp_tokens = max_tokens_saida_2 / 10
+    prompt = (
+        f"Faça análises, em {idioma_atual}, adaptadas preferencialmente para {target}, com base nos tipos psicológicos "
+        f"e suas atitudes, de acordo com a teoria de Carl Gustav Jung: "
+        f"Escreva em {temp_tokens} tokens quais o tipos (dentre: Pensamento Extrovertido, Pensamento Introvertido, "
+        f"Sentimento Extrovertido, Sentimento Introvertido, Sensação Extrovertida, Sensação Introvertida, Intuição "
+        f"Extrovertida, Intuição Introvertida.) seriam fortemente favoráveis às ideias apresentadas no texto fonte e "
+        f"suas razões."
+        f"Escreva em {temp_tokens} tokens quais o tipos (dentre: Pensamento Extrovertido, Pensamento Introvertido, "
+        f"Sentimento Extrovertido, Sentimento Introvertido, Sensação Extrovertida, Sensação Introvertida, Intuição "
+        f"Extrovertida, Intuição Introvertida.) seriam fortemente contrários às ideias apresentadas no texto fonte e "
+        f"suas razões."
+        f"O texto fonte é: {info}"
+    )
+    system = (
+        "Você pensa como um acadêmico junguiano especializado em tipos psicológicos. "
+        "Você avalia usando como base os tipos: Pensamento Extrovertido, Pensamento Introvertido, Sentimento "
+        "Extrovertido, Sentimento Introvertido, Sensação Extrovertida, Sensação Introvertida, Intuição Extrovertida e "
+        "Intuição Introvertida. "
+        f"Você usa como base o conteúdo deste texto: {jung}"
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=temp_tokens)
+
+
+def ArquetiposJung(info, target, max_tokens_saida_2, arquetipoJungFile, idioma_atual):
+    temp_tokens = max_tokens_saida_2 / 10
+    # print(f"Temp tokens: {temp_tokens}")
+    prompt = (
+        f"Faça análises, em {idioma_atual}, adaptadas preferencialmente para {target}, explicando qual o arquétipo junguiano "
+        f"que representaria com maior fidelidade o conteúdo do texto fonte. "
+        f"Escreva em {temp_tokens} tokens. "
+        f"A lista de arquétipos possíveis está aqui: {arquetipoJungFile}"
+        f"O texto fonte é: {info}"
+    )
+    system = (
+        "Você pensa como um acadêmico junguiano especializado em arquétipos. "
+        f"Escreva no máximo {temp_tokens} tokens"
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.3, max_tokens=temp_tokens)
+
+
+def Filmografia(info, target, max_tokens_saida_2, idioma_atual):
+    temp_tokens = max_tokens_saida_2 / 15
+    # print(f"Temp tokens: {temp_tokens}")
+    prompt = (
+        f"Escrevendo em {idioma_atual} em texto preferencialmente adaptado para {target}, "
+        f"encontre o filme, lançado até 2022, que mais se relacionado com as palavras-chaves predominantes no texto "
+        f"a seguir."
+        f"Escreva em {temp_tokens} tokens. "
+        f"O texto fonte é: {info}"
+    )
+    system = (
+        "Você é um especialista em filmes. "
+        f"Escreva no máximo {temp_tokens} tokens usando o idioma {idioma_atual}. "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.1, max_tokens=temp_tokens)
+
+
+def Eneagrama(info, target, max_tokens_saida_2, eneagramaFile, idioma_atual):
+    temp_tokens = 300
+    prompt = (
+        f"Faça análises, em {idioma_atual}, adaptadas preferencialmente para {target}, explicando quais  os 2 tipos "
+        f"do eneagrama que mais criticariam positiva e negativamente o conteúdo do texto fonte. "
+        f"Escreva no máximo {temp_tokens} tokens. "
+        f"A lista de tipos do eneagrama possíveis está aqui: {eneagramaFile}. "
+        f"O texto fonte é: {info}"
+    )
+    system = (
+        "Você pensa como um acadêmico junguiano especializado em arquétipos. "
+        f"Escreva no máximo {temp_tokens} tokens"
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=temp_tokens)
+
+
+def FAnalisePolitica(info, target, max_tokens_saida_2, idioma_atual):
+    temp_tokens = max_tokens_saida_2 / 5
+    prompt = (
+        f"Analise o seguinte texto político, se possível com linguagem adaptada para {target}, utilizando um modelo "
+        f"multidimensional. Classifique o conteúdo em cinco eixos ideológicos e justifique cada classificação com "
+        f"base no texto."
+        f"1 - Primeiro, Eixo Econômico: determine se o texto se inclina para a esquerda econômica (redistribuição de "
+        f"renda, igualdade, controle estatal) ou direita econômica (livre mercado, propriedade privada, mínima "
+        f"intervenção estatal) e justifique. "
+        f"2 - Segundo, Eixo Social ou Cultural: avalie se o texto adota uma perspectiva progressista (foco em direitos "
+        f"sociais, mudanças culturais rápidas) ou conservadora (valorização da tradição, mudanças graduais) e "
+        f"justifique."
+        f"Terceiro, Eixo de Autoritarismo ou Liberdade: identifique se o texto é autoritário (controle estatal elevado, "
+        f"restrições de liberdades individuais) ou libertário (máxima liberdade individual, limitação do controle "
+        f"estatal) e justifique. "
+        f"4 - Quarto, Eixo Ambiental: "
+        f"verifique se o texto prioriza uma abordagem ecocêntrica (sustentabilidade ambiental, regulação) ou "
+        f"tecnocêntrica"
+        f"(crescimento econômico e tecnológico com menor foco ambiental) e justifique. "
+        f"5 - Quinto, Eixo Internacional ou Geopolítico: classifique o texto como globalista (cooperação internacional, "
+        f"integração econômica) ou nacionalista (soberania nacional, autossuficiência) e justifique. "
+        f"Para cada eixo, forneça a classificação exata e a explicação concisa que justifica sua conclusão. "
+        f"Texto a ser analisado: {info}. "
+        f"Escreva no máximo {temp_tokens} tokens. "
+    )
+    system = (
+        "Você é um analista político especialista em ideologias. "
+        f"Escreva no máximo {temp_tokens} tokens"
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.2, max_tokens=temp_tokens)
+
+
+def Divindades(info, target, max_tokens_saida_2, divindades, idioma_atual, caminho_arquivo_temp):
+    max_tokens = max_tokens_saida_2 / 15
+
+    global g_resumosAnteriores2
+    prompt = (
+        f"Escreva uma opinião em {idioma_atual} sobre o tema '[{info}]' da perspectiva de um deus que mais possa influenciar a discussão de forma crítica. "
+        f"O deus deve ser escolhido a partir da seguinte lista: {divindades}. "
+        f"Escolha deuses de diversas partes do planeta, favorecendo a diversidade continental. "
+        "Para cada deus escolhido, inclua uma breve explicação sobre sua importância ou atributos e liste mais 2 deuses que têm o mesmo posicionamento. "
+        f"Escreva preferencialmente para {target} em no máximo {max_tokens} tokens, talvez 10 tokens a mais ou a menos. "
+        f"Escolha, quando possível, divindades diferentes das que estão aqui: {g_resumosAnteriores2}."
+    )
+    system = (
+        "Você é um especialista que irá apresentar a opinião da perspectiva de um deus que mais pode influenciar criticamente a discussão sobre o tema fornecido. "
+        f"Escolha o deus mais adequado da seguinte lista: {divindades}. "
+        "Para cada deus escolhido, inclua uma breve explicação sobre sua importância ou atributos e liste mais 2 deuses que têm o mesmo posicionamento. "
+        f"Escreva no idioma: {idioma_atual} "
+        f"Escreva no máximo {max_tokens} tokens. "
+    )
+    g_resumosAnteriores2 = enviador(idioma_atual, prompt, system, 0.1, max_tokens=max_tokens)
+
+    return g_resumosAnteriores2
+
+
+def mapa_conceitual(info, max_tokens_saida_1, idioma_atual):
+    max_linhas = max_tokens_saida_1 / 100
+    global g_max_tokens_saida_2
+
+    prompt = (
+        f"Transforme o texto em um mapa conceitual de {max_linhas} linhas com as principais informações. "
+        f"Cada linha do mapa conceitual deve ser feita no modelo: 'conceito - verbo flexionado - conceito' no idioma {idioma_atual}. "
+        f"Adicione '<silence msec=\"100\"/>' no início de cada linha "
+        f"Adicione ' <emph> ' antes do verbo flexionado. "
+        f"Adicione ' </emph> ' após do verbo flexionado. "
+        f"O texto a ser transformado em mapa conceitual é: {info}"
+    )
+    system = (
+        "Você é um especialista em mapas conceituais."
+        f"Escreva no idioma: {idioma_atual} "
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.5, max_tokens=g_max_tokens_saida_2)
+
+
+def senryu(info, idioma_atual):
+    prompt = (
+        f"Escreva no idioma: {idioma_atual} uma poesia do tipo Senryu (17 sílabas divididas em três linhas num padrão de 5-7-5) sobre: {info}"
+    )
+
+    system = (
+        "Você é um especialista em poesia japonesa Senryu. "
+        "Senryu geralmente consistem em 17 sílabas divididas em três linhas num padrão de 5-7-5. "
+        "Você não escreve mais do que 3 linhas. "
+        "Você adere estritamente ao texto original. "
+        f"Escreva no idioma: {idioma_atual}"
+
+    )
+
+    return enviador(idioma_atual, prompt, system, 0.5, 40)
+
+
+def calcular_custos(arquivos, max_tokens_saida_1, max_tokens_saida_2):
+    num_paginas = 0
+
+    for arquivo in arquivos:
+        if arquivo.lower().endswith('.pdf'):
+            with open(arquivo, 'rb') as f:
+                leitor_pdf = PdfReader(f)
+                num_paginas += len(leitor_pdf.pages)  # Use len(reader.pages)
+
+        elif arquivo.lower().endswith(('.doc', '.docx')):
+            doc = Document(arquivo)
+            num_paginas += len(doc.paragraphs) // 2  # Estimativa para documentos do Word
+
+    total_tokens = 1300 * num_paginas
+    custo = (total_tokens / 1_000_000) * 0.150 + (16000 / 1_000_000) * 0.600
+    tempo_estimado = total_tokens / 1000 * 0.13 + (
+            len(arquivos) * 0.13 * (
+            total_tokens / max_tokens_saida_1 + max_tokens_saida_2))  # Tempo de trabalho mais pausas
+
+    return total_tokens, custo, tempo_estimado
+
+
+def substituir_caracteres(documento):
+    for paragrafo in documento.paragraphs:
+        info_original = paragrafo.text
+        info_modificado = info_original.replace('**', '').replace('#', '')
+        if info_original != info_modificado:
+            paragrafo.text = info_modificado
+
+    for tabela in documento.tables:
+        for linha in tabela.rows:
+            for celula in linha.cells:
+                for paragrafo in celula.paragraphs:
+                    info_original = paragrafo.text
+                    info_modificado = info_original.replace('*', '...').replace('#', '...')
+                    if info_original != info_modificado:
+                        paragrafo.text = info_modificado
+
+
+contadorMSG = 0
+
+
+def processar_idioma(idioma_atual, documento_resumido, documento_extra, caminho_saida, caminho_extra_saida,
+                     progresso_path, caminhos_arquivos, target,
+                     profissao, max_tokens_saida_1, max_tokens_saida_2, tokens_entrada, incluir_cronologia,
+                     incluir_perguntas,
+                     numero_perguntas, incluir_analises_perspectivas, jung, divindades, incluir_divindades, pensadores,
+                     documento_mapa_conceitual, caminho_mapa_conceitual_saida, incluir_dicionario, arquetipoJungFile,
+                     eneagramaFile, incluir_falacias, index_arquivo, index_chunk, incluir_1, incluir_2, incluir_3,
+                     incluir_4, incluir_5):
+    import os
+    import sys
+    import time
+    from docx import Document
+    from tqdm import tqdm
+
+    contadorMSG = 0
+    cronologia_full = ""
+    global g_inserir_resumo_global
+
+    # Inicializar os documentos dentro da thread/processo
+    documento_resumido = Document()
+    documento_extra = Document()
+    documento_mapa_conceitual = Document()
+
+    if contadorMSG == 0:
+        total_tokens, custo, tempo_estimado = calcular_custos(caminhos_arquivos, max_tokens_saida_1,
+                                                              max_tokens_saida_2)
+        info_msg = (f"Total de tokens: {total_tokens}\n"
+                    f"Custo estimado: ${custo:.2f}\n"
+                    f"Tempo estimado: {tempo_estimado / 60:.2f} minutos")
+        print(info_msg)
+        # messagebox.showinfo("Informações de Tarefa", info_msg)
+        contadorMSG += 1
+
+    arquivo_temporario = criar_arquivo_temporario()
+    arquivo_temporario2 = criar_arquivo_temporario()
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    def process_titulo(resumo1, idioma_atual, contador2):
+        print("----------")
+        msg = f"{datetime.now().strftime('%H:%M:%S')} - Resumindo titulo {contador2} idioma: {idioma_atual}"
+        print(msg)
+        titulo_resumido = resumir_titulo(resumo1, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas,
+                                         numero_perguntas, idioma_atual)
+        documento_resumido.add_paragraph(",,,,, ")
+        documento_resumido.add_paragraph(titulo_resumido)
+        documento_resumido.add_paragraph(" ")
+
+        # Adicionar ao documento extra
+        msg_extra = f"{datetime.now().strftime('%H:%M:%S')} - {idioma_atual}: Documento Extra {contador2}"
+        print(msg_extra)
+        documento_extra.add_paragraph(",,,,, ")
+        documento_extra.add_paragraph(titulo_resumido)
+        documento_extra.add_paragraph(" ")
+
+        # Adicionar ao mapa conceitual
+        msg_extra = f"{datetime.now().strftime('%H:%M:%S')} - {idioma_atual}: Mapa Conceitual Extra {contador2}"
+        print(msg_extra)
+        documento_mapa_conceitual.add_paragraph(",,,,, ")
+        documento_mapa_conceitual.add_paragraph(titulo_resumido)
+        documento_mapa_conceitual.add_paragraph(" ")
+
+    def process_senryu(chunk, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Incluindo poesia Senryu {contador2} idioma: {idioma_atual}")
+        resultado_senryu = senryu(chunk, idioma_atual)
+        documento_resumido.add_paragraph(f"\n Poesia japonesa Senryu: \n" if idioma_atual == "Português do Brasil"
+                                         else f"\n Japanese Senryu poetry: \n" if idioma_atual == "English"
+        else f"\n Poesía japonesa Senryu: \n")
+        documento_resumido.add_paragraph(resultado_senryu)
+        documento_resumido.add_paragraph(" ")
+
+    def process_resumir_para_imagem(resumo1, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Resumindo para imagem {contador2} idioma: {idioma_atual}")
+        resumo_imagem = resumir_para_imagem(resumo1, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas,
+                                            numero_perguntas, arquivo_temporario, idioma_atual)
+        documento_resumido.add_paragraph(resumo_imagem)
+        documento_resumido.add_paragraph(" ")
+
+    def process_resumir_info(idioma_atual, contador2, resumo_anterior):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Resumindo info {contador2} idioma: {idioma_atual}")
+        resumo1 = resumir_info(chunk, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas,
+                               numero_perguntas,
+                               idioma_atual, resumo_anterior)
+        return resumo1
+
+    def process_resumir_resumo_info(idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Resumindo o resumo de info {contador2} idioma: {idioma_atual}")
+        resumoDoResumo = resumir_resumo_info(chunk, target, max_tokens_saida_1, incluir_cronologia, incluir_perguntas,
+                               numero_perguntas,
+                               idioma_atual)
+        return resumoDoResumo
+
+    def process_escrever_resumo_info(resumo1, idioma_atual, contador2):
+        documento_resumido.add_paragraph(resumo1)
+        documento_resumido.add_paragraph(" ")
+
+        # Adicionar ao documento extra
+        print(f"{datetime.now().strftime('%H:%M:%S')} - {idioma_atual}: Documento Extra {contador2}")
+        documento_extra.add_paragraph("")
+        documento_extra.add_paragraph(resumo1)
+        documento_extra.add_paragraph(" ")
+
+        # Adicionar ao Mapa Conceitual
+        print(f"{datetime.now().strftime('%H:%M:%S')} - {idioma_atual}: Documento Mapa Conceitual {contador2}")
+        documento_extra.add_paragraph("")
+        documento_extra.add_paragraph(resumo1)
+        documento_extra.add_paragraph(" ")
+
+    def process_falacia_logica(resumo, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Contraditório {contador2} idioma: {idioma_atual}")
+        resumo_falacia_logica = falacia_logica(chunk, target, max_tokens_saida_2, idioma_atual, tokens_entrada)
+        documento_resumido.add_paragraph(f"\n Análise de falácias: " if idioma_atual == "Português do Brasil"
+                                         else f"\n Analysis of falacies: " if idioma_atual == "English"
+        else f"\n Análisis de falacias: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_falacia_logica)
+        documento_resumido.add_paragraph(" ")
+
+    def process_pensadores(resumo, idioma_atual, lista_pensadores, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Comparar pensadores {contador2} idioma: {idioma_atual}")
+        resumo_pensadores = gerar_pensadores(resumo, target, idioma_atual, lista_pensadores)
+        documento_resumido.add_paragraph(f"\n Grandes Pensadores: " if idioma_atual == "Português do Brasil"
+                                         else f"\n Great Thinkers: " if idioma_atual == "English"
+        else f"\n Grandes Pensadores: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_pensadores)
+        documento_resumido.add_paragraph(" ")
+
+    def process_dialetica(resumo, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Dialética {contador2} idioma: {idioma_atual}")
+        dialetica = f"\n Análise dialética: " if idioma_atual == "Português do Brasil" \
+            else f"\n Dialetical analysis: " if idioma_atual == "English" \
+            else f"\n Análisis dialéctico: " if idioma_atual == "Español" else ""
+        resumo_dialetica = analise_dialetica(resumo, target, idioma_atual)
+        documento_resumido.add_paragraph(dialetica)
+        documento_resumido.add_paragraph(resumo_dialetica)
+        documento_resumido.add_paragraph(" ")
+
+    def process_perspectivas_jung(resumo, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo perspectivas_jung {contador2} idioma: {idioma_atual}")
+        resumo_perspectivas_jung = perspectivas_jung(resumo, target, max_tokens_saida_2, jung, idioma_atual)
+        documento_resumido.add_paragraph(
+            f"\n Perspectiva dos tipos junguianos criticando o texto original: " if idioma_atual == "Português do Brasil"
+            else f"\n Jungian typology in critique to the original text: " if idioma_atual == "English"
+            else f"\n Perspectiva de los tipos junguianos criticando el texto original: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_perspectivas_jung)
+        documento_resumido.add_paragraph(" ")
+
+    def process_ArquetiposJung(resumo, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Arquétipos Jung {contador2} idioma: {idioma_atual}")
+        resumo_arquetipo_jung = ArquetiposJung(resumo, target, max_tokens_saida_2, arquetipoJungFile, idioma_atual)
+        documento_resumido.add_paragraph(
+            f"\n Arquétipo dominante no trecho: " if idioma_atual == "Português do Brasil"
+            else f"\n Dominant archetype in the excerpt: " if idioma_atual == "English"
+            else f"\n Arquetipo dominante en el fragmento: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_arquetipo_jung)
+        documento_resumido.add_paragraph(" ")
+
+    def process_Eneagrama(resumo, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Arquétipos Jung {contador2} idioma: {idioma_atual}")
+        resumo_eneagrama = Eneagrama(resumo, target, max_tokens_saida_2, eneagramaFile, idioma_atual)
+        documento_resumido.add_paragraph(
+            f"\n Eneagrama: " if idioma_atual == "Português do Brasil"
+            else f"\n Enneagram: " if idioma_atual == "English"
+            else f"\n Eneagrama: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_eneagrama)
+        documento_resumido.add_paragraph(" ")
+
+    def process_AnalisePolitica(resumo, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Análise Política {contador2} idioma: {idioma_atual}")
+        resumo_analisePolitica = FAnalisePolitica(resumo, target, max_tokens_saida_2, idioma_atual)
+        documento_resumido.add_paragraph(
+            f"\n Análise Política: " if idioma_atual == "Português do Brasil"
+            else f"\n Political Analysis: " if idioma_atual == "English"
+            else f"\n Análisis político: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_analisePolitica)
+        documento_resumido.add_paragraph(" ")
+
+    def process_divindades(chunk, idioma_atual, contador2, caminho_arquivo_temp):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Incluindo divindades {contador2} idioma: {idioma_atual}")
+        resumo_divindades = Divindades(chunk, target, max_tokens_saida_2, divindades, idioma_atual,
+                                       caminho_arquivo_temp)
+        documento_resumido.add_paragraph(
+            f"\n Divindades históricas: " if idioma_atual == "Português do Brasil"
+            else f"\n Historical deities: " if idioma_atual == "English"
+            else f"\n Deidades históricas: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_divindades)
+        documento_resumido.add_paragraph(" ")
+
+    def process_mapa_conceitual(chunk, max_tokens_saida_1, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo Mapa Conceitual {contador2} idioma: {idioma_atual}")
+        resumo_mapa_conceitual = mapa_conceitual(chunk, max_tokens_saida_1, idioma_atual)
+        documento_resumido.add_paragraph(
+            f"\n Mapa Conceitual: " if idioma_atual == "Português do Brasil"
+            else f"\n Concept Map: " if idioma_atual == "English"
+            else f"\n Mapa Conceptual: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_mapa_conceitual)
+        documento_resumido.add_paragraph(" ")
+
+        documento_mapa_conceitual.add_paragraph(
+            f"\n Mapa Conceitual: " if idioma_atual == "Português do Brasil"
+            else f"\n Concept Map: " if idioma_atual == "English"
+            else f"\n Mapa Conceptual: " if idioma_atual == "Español" else "")
+        documento_mapa_conceitual.add_paragraph(resumo_mapa_conceitual)
+        documento_mapa_conceitual.add_paragraph(" ")
+
+    def process_escolas_do_pensamento(resumo, chunk, idioma_atual, contador2):
+        print(
+            f"{datetime.now().strftime('%H:%M:%S')} - Incluindo escolas_do_pensamento {contador2} idioma: {idioma_atual}")
+        resumo_escolas = escolas_do_pensamento(chunk, target, max_tokens_saida_2, idioma_atual, tokens_entrada,
+                                               chunk)
+        documento_resumido.add_paragraph(
+            f"\n Salão das escolas de pensamento: " if idioma_atual == "Português do Brasil"
+            else f"\n Hall of schools of thought: " if idioma_atual == "English"
+            else f"\n Salón de escuelas de pensamiento: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(resumo_escolas)
+        documento_resumido.add_paragraph(" ")
+
+    def process_dicionario(chunk, numero_perguntas, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Gerando Dicionário {contador2} idioma: {idioma_atual}  ")
+        dicionario = fazer_dicionario(chunk, max_tokens_saida_1, idioma_atual)
+        documento_resumido.add_paragraph(
+            "Dicionário:" if idioma_atual == "Português do Brasil"
+            else "Dictionary:" if idioma_atual == "English"
+            else "Diccionario:" if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(dicionario)
+
+    def process_cronologia(chunk, idioma_atual, cronologia_full, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Gerando Cronologia {contador2} idioma: {idioma_atual}  ")
+        cronologia = fazer_cronologia(chunk, max_tokens_saida_2, idioma_atual)
+        documento_resumido.add_paragraph(
+            "Cronologia:" if idioma_atual == "Português do Brasil"
+            else "Chronology:" if idioma_atual == "English"
+            else "Cronologia:" if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(cronologia)
+        cronologia_full += cronologia + "\n"
+
+    def process_perguntas(chunk, numero_perguntas, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Gerando Perguntas {contador2} idioma: {idioma_atual}  ")
+        perguntas = fazer_perguntas(chunk, numero_perguntas, idioma_atual)
+        documento_resumido.add_paragraph(
+            "Perguntas:" if idioma_atual == "Português do Brasil"
+            else "Questions:" if idioma_atual == "English"
+            else "Preguntas:" if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(perguntas)
+
+    def process_esfinge(chunk, idioma_atual, contador2):
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Pergunta da Esfinge {contador2} idioma: {idioma_atual}  ")
+        pergunta = esfinge(chunk, idioma_atual)
+        documento_resumido.add_paragraph(
+            "Pergunta da Esfinge:" if idioma_atual == "Português do Brasil"
+            else "The Sphinx's Question:" if idioma_atual == "English"
+            else "Pregunta de la Esfinge:" if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(pergunta)
+        documento_resumido.add_paragraph("<silence msec=\"2000\"/>")
+
+    def process_filmografia(chunk, idioma_atual, contador2):
+
+        print(f"{datetime.now().strftime('%H:%M:%S')} - Inserindo Filmografia {contador2} idioma: {idioma_atual}  ")
+        filmografia = Filmografia(chunk, target, max_tokens_saida_2, idioma_atual)
+        documento_resumido.add_paragraph(
+            "Filmografia: " if idioma_atual == "Português do Brasil"
+            else "Filmography: " if idioma_atual == "English"
+            else "Filmografía: " if idioma_atual == "Español" else "")
+        documento_resumido.add_paragraph(filmografia)
+        documento_resumido.add_paragraph("<silence msec=\"5000\"/>")
+
+    g_resumo_full = None  # None  # Variável local para armazenar o resumo completo
+
+    # Executar resumir_info_full antes de qualquer outro processamento
+    if g_resumo_full is None:
+        print(f"{datetime.now().strftime('%H:%M:%S')} - [{idioma_atual}] - Preparando Resumo 128k")
+        info_completo = " ".join([ler_arquivo(caminho, "", "") for caminho in caminhos_arquivos])
+        chunks_full = dividir_texto_por_tokens(info_completo, 15000)
+        g_resumo_full = ""
+        for chunk in chunks_full:
+            contador = 1
+            if g_inserir_resumo_global:
+                resumo = resumir_info_full(
+                    info=chunk,
+                    target=target,
+                    max_tokens_saida_1=max_tokens_saida_1,
+                    incluir_cronologia=incluir_cronologia,
+                    incluir_dicionario=incluir_dicionario,
+                    incluir_perguntas=incluir_perguntas,
+                    numero_perguntas=numero_perguntas,
+                    idioma_atual=idioma_atual
+                )
+                g_resumo_full += resumo + " "  # Concatenar os resumos
+                # time.sleep(random.uniform(0.1, 2.0))
+                print(
+                    f"{datetime.now().strftime('%H:%M:%S')} [{idioma_atual}]: Resumo completo Chunk.")
+                contador += 1
+            else:
+                pass
+
+    processo_concluido = False  # Inicializa como False
+    global g_rodada
+    g_rodada = 1
+
+    try:
+        for i in tqdm(range(index_arquivo, len(caminhos_arquivos)), desc=f"Processando arquivos ({idioma_atual})"):
+            caminho_arquivo = caminhos_arquivos[i]
+            info_completo = ler_arquivo(caminho_arquivo, "", "")
+
+            chunks = dividir_texto_por_tokens(info_completo, tokens_entrada)
+
+            resumo_anterior = None  # Inicializar o resumo anterior como None
+
+            for j, chunk in enumerate(chunks[index_chunk:], start=index_chunk):
+
+                print(f"[{idioma_atual}] Pedaço: {j + 1} de {len(chunks)} ")
+                contador2 = f"{j + 1}/{len(chunks)}"
+
+                # Operações comuns para ambos os idiomas
+                resumo1 = process_resumir_info(idioma_atual, contador2, resumo_anterior)
+                resumo_anterior = process_resumir_resumo_info(idioma_atual, contador2)
+
+                process_titulo(resumo1, idioma_atual, contador2)
+                process_senryu(resumo1, idioma_atual, contador2)
+                process_resumir_para_imagem(resumo1, idioma_atual, contador2)
+                process_esfinge(resumo1, idioma_atual, contador2)
+
+                process_escrever_resumo_info(resumo1, idioma_atual, contador2)
+
+                if incluir_falacias:
+                    process_falacia_logica(chunk, idioma_atual, contador2)
+
+                process_mapa_conceitual(resumo1, max_tokens_saida_1, idioma_atual, contador2)
+                process_filmografia(resumo1, idioma_atual, contador2)
+                process_AnalisePolitica(resumo1, idioma_atual, contador2)
+                process_dialetica(resumo1, idioma_atual, contador2)
+                process_escolas_do_pensamento(resumo1, chunk, idioma_atual, contador2)
+
+                if incluir_analises_perspectivas:
+                    process_ArquetiposJung(resumo1, idioma_atual, contador2)
+                    process_perspectivas_jung(resumo1, idioma_atual, contador2)
+                    process_Eneagrama(resumo1, idioma_atual, contador2)
+                    process_pensadores(resumo1, idioma_atual, pensadores, contador2)
+
+                if incluir_divindades:
+                    process_divindades(resumo1, idioma_atual, contador2, arquivo_temporario2)
+
+                if incluir_cronologia:
+                    process_cronologia(chunk, idioma_atual, cronologia_full, contador2)
+
+                if incluir_dicionario:
+                    process_dicionario(chunk, numero_perguntas, idioma_atual, contador2)
+
+                if incluir_perguntas:
+                    process_perguntas(chunk, numero_perguntas, idioma_atual, contador2)
+
+                # Atualizar progresso
+                progresso = {
+                    'caminhos_arquivos': caminhos_arquivos,
+                    'target': target,
+                    'profissao': profissao,
+                    'max_tokens_saida_1': max_tokens_saida_1,
+                    'max_tokens_saida_2': max_tokens_saida_2,
+                    'tokens_entrada': tokens_entrada,
+                    'idioma': idioma_atual,
+                    'index_arquivo': i,
+                    'index_chunk': j + 1,
+                    'documento_resumido_path': caminho_saida,
+                    'documento_extra_path': caminho_extra_saida,
+                    'documento_mapa_conceitual_path': caminho_mapa_conceitual_saida,
+                    'incluir_cronologia': incluir_cronologia,
+                    'incluir_dicionario': incluir_dicionario,
+                    'incluir_perguntas': incluir_perguntas,
+                    'incluir_1': incluir_1,
+                    'incluir_2': incluir_2,
+                    'incluir_3': incluir_3,
+                    'incluir_4': incluir_4,
+                    'incluir_5': incluir_5,
+                    'numero_perguntas': numero_perguntas,
+                    'inicio_texto': "",
+                    'fim_texto': "",
+                    'incluir_analises_perspectivas': incluir_analises_perspectivas,
+                    'incluir_falacias': incluir_falacias,
+                    'incluir_divindades': incluir_divindades
+                }
+
+                documento_resumido.add_paragraph("<silence msec=\"3000\"/>")
+                documento_extra.add_paragraph("<silence msec=\"3000\"/>")
+                documento_mapa_conceitual.add_paragraph("<silence msec=\"3333\"/>")
+
+                try:
+                    documento_resumido.save(caminho_saida)
+                    documento_extra.save(caminho_extra_saida)
+                    documento_mapa_conceitual.save(caminho_mapa_conceitual_saida)
+                    print(
+                        f"{timestamp} - Progresso salvo em: {caminho_saida} e\n {caminho_extra_saida} e\n {caminho_mapa_conceitual_saida}")
+                except Exception as e:
+                    print(f"{timestamp} - Erro ao salvar os documentos durante o processamento: {e}")
+                salvar_progresso(progresso, progresso_path)
+
+                if g_rodada % 2 == 1:
+                    g_rodada += 0.5
+                sleep1 = 5  # random.randint(2, 5)
+                time.sleep(sleep1 * g_rodada)
+                print(f"Espera de {sleep1 * g_rodada}. ")
+                if g_rodada > 6:
+                    g_rodada = 1
+
+        # Adicionar Resumo Full
+        if g_inserir_resumo_global:
+            if idioma_atual == "Português do Brasil":
+                print(f"Adicionado Resumo full e cronologia total em {idioma_atual}")
+                documento_resumido.add_paragraph(
+                    f"\n <silence msec=\"10000\"/> Resumo completo do livro: {g_resumo_full}")
+                documento_resumido.add_paragraph(f"\n {cronologia_full} \n")
+                documento_extra.add_paragraph(f"\n <silence msec=\"10000\"/> {cronologia_full} \n")
+                cronologia_full = ""
+            if idioma_atual == "English":
+                print(f"Adicionado Resumo full e cronologia total em {idioma_atual}")
+                documento_resumido.add_paragraph(
+                    f"\n <silence msec=\"10000\"/> Full summary of the book: {g_resumo_full}")
+                documento_resumido.add_paragraph(f"\n {cronologia_full} \n")
+                documento_extra.add_paragraph(f"\n <silence msec=\"10000\"/> {cronologia_full} \n")
+                cronologia_full = ""
+            if idioma_atual == "Español":
+                print(f"Adicionado Resumo full e cronologia total em {idioma_atual}")
+                documento_resumido.add_paragraph(
+                    f"\n <silence msec=\"10000\"/> Resumen completo del libro: {g_resumo_full}")
+                documento_resumido.add_paragraph(f"\n {cronologia_full} \n")
+                documento_extra.add_paragraph(f"\n <silence msec=\"10000\"/> {cronologia_full} \n")
+                cronologia_full = ""
+        else:
+            pass
+        documento_resumido.add_paragraph("<silence msec=\"3333\"/>")
+        documento_extra.add_paragraph("<silence msec=\"3333\"/>")
+        documento_mapa_conceitual.add_paragraph("<silence msec=\"3333\"/>")
+        print("Adicionado os 30s")
+        processo_concluido = True
+
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n{timestamp} - Interrupção detectada. Salvando progresso antes de encerrar.")
+    except Exception as e:
+        print(f"\n{timestamp} - Ocorreu um erro inesperado: {e}. Salvando progresso antes de encerrar.")
+        traceback.print_exc()
+    finally:
+        try:
+            documento_resumido.save(caminho_saida)
+            documento_extra.save(caminho_extra_saida)
+            documento_mapa_conceitual.save(caminho_mapa_conceitual_saida)
+            print(
+                f"{timestamp} - Arquivos gerados em: {caminho_saida} e {caminho_extra_saida} e {caminho_mapa_conceitual_saida}")
+        except Exception as e:
+            print(f"{timestamp} - Erro ao salvar os arquivos: {e}")
+
+        substituir_caracteres(documento_resumido)
+        substituir_caracteres(documento_extra)
+
+        if os.path.exists(arquivo_temporario):
+            os.remove(arquivo_temporario)
+
+        if os.path.exists(arquivo_temporario2):
+            os.remove(arquivo_temporario2)
+
+        if processo_concluido:
+            if os.path.exists(progresso_path):
+                os.remove(progresso_path)
+
+
+from multiprocessing import Process
+import os
+import sys
+from datetime import datetime
+from tkinter import messagebox
+
+# Configuração básica do logging
+logging.basicConfig(
+    filename='processamento.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+
+def main():
+    print("Iniciando o processo de seleção de arquivos.")
+    caminhos_arquivos = escolher_arquivos()
+
+    if not caminhos_arquivos:
+        print("Nenhum arquivo selecionado. Encerrando o programa.")
+        return
+
+    print("Arquivos selecionados:", caminhos_arquivos)
+
+    print("Coletando opções iniciais.")
+    (publico, profissao, tokens_entrada, max_tokens_saida_1, max_tokens_saida_2,
+     incluir_cronologia, incluir_perguntas, numero_perguntas, incluir_analises_perspectivas,
+     incluir_divindades, incluir_dicionario, incluir_falacias, incluir_1, incluir_2, incluir_3,
+     incluir_4, incluir_5) = coletar_opcoes_iniciais(caminhos_arquivos)
+
+    print("Opções coletadas.")
+
+    jung = ler_arquivo_base('jung')
+    arquetipoJungFile = ler_arquivo_base('arquetipoJungFile')
+    eneagramaFile = ler_arquivo_base('eneagrama')
+    divindades = ler_arquivo_base('divindades')
+    pensadores = ler_arquivo_base('pensadores')
+
+    timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+
+    caminhos_saida = {}
+    caminhos_extra_saida = {}
+    caminhos_mapa_conceitual_saida = {}
+    progresso_paths = {}
+
+    for idioma_atual in g_idiomas:
+        # Definindo os caminhos de saída para cada idioma
+        caminho_saida = os.path.join(os.path.dirname(caminhos_arquivos[0]),
+                                     f"{idioma_atual}_Resumo_{timestamp}.docx")
+        caminhos_saida[idioma_atual] = caminho_saida
+
+        caminho_extra_saida = os.path.join(os.path.dirname(caminhos_arquivos[0]),
+                                           f"{idioma_atual}_Resumo-Seco.docx")
+        caminhos_extra_saida[idioma_atual] = caminho_extra_saida
+
+        caminho_mapa_conceitual_saida = os.path.join(os.path.dirname(caminhos_arquivos[0]),
+                                                     f"{idioma_atual}_Mapa-Conceitual.docx")
+        caminhos_mapa_conceitual_saida[idioma_atual] = caminho_mapa_conceitual_saida
+
+        progresso_paths[idioma_atual] = f"progresso_{idioma_atual}.json"
+
+    # Calcular custos antes de processar os idiomas
+    total_tokens, custo, tempo_estimado = calcular_custos(caminhos_arquivos, max_tokens_saida_1, max_tokens_saida_2)
+    info_msg = (f"Total de tokens: {total_tokens}\n"
+                f"Custo estimado: ${custo:.2f}\n"
+                f"Tempo estimado: {tempo_estimado / 60:.2f} minutos")
+    print(info_msg)
+    # messagebox.showinfo("Informações de Tarefa", info_msg)
+
+    processes = []
+
+    for idioma_atual in g_idiomas:
+        print(f"{timestamp} - Iniciando processamento de arquivos para o idioma: {idioma_atual}")
+
+        progresso_path = progresso_paths[idioma_atual]
+        index_arquivo = 0
+        index_chunk = g_comecar_do_chunk - 1
+        progresso = carregar_progresso(progresso_path)
+        if progresso:
+            if perguntar_continuar(idioma_atual, index_arquivo, index_chunk):
+                index_arquivo = progresso['index_arquivo']
+                index_chunk = progresso['index_chunk']
+            else:
+                # Remove progress file if user chooses not to continue
+                os.remove(progresso_path)
+        else:
+            index_arquivo = 0
+            index_chunk = g_comecar_do_chunk - 1
+
+        # Criando um processo para cada idioma com argumentos nomeados
+        process = Process(
+            target=processar_idioma,
+            kwargs={
+                'idioma_atual': idioma_atual,
+                'documento_resumido': caminhos_saida[idioma_atual],
+                'documento_extra': caminhos_extra_saida[idioma_atual],
+                'documento_mapa_conceitual': caminhos_mapa_conceitual_saida[idioma_atual],
+                'caminho_saida': caminhos_saida[idioma_atual],
+                'caminho_extra_saida': caminhos_extra_saida[idioma_atual],
+                'caminho_mapa_conceitual_saida': caminhos_mapa_conceitual_saida[idioma_atual],
+                'progresso_path': progresso_paths[idioma_atual],
+                'index_arquivo': index_arquivo,
+                'index_chunk': index_chunk,
+                'caminhos_arquivos': caminhos_arquivos,
+                'target': publico,  # Mapeando 'publico' para 'target'
+                'profissao': profissao,
+                'max_tokens_saida_1': max_tokens_saida_1,
+                'max_tokens_saida_2': max_tokens_saida_2,
+                'tokens_entrada': tokens_entrada,
+                'incluir_cronologia': incluir_cronologia,
+                'incluir_dicionario': incluir_dicionario,
+                'incluir_perguntas': incluir_perguntas,
+                'incluir_1': incluir_1,
+                'incluir_2': incluir_2,
+                'incluir_3': incluir_3,
+                'incluir_4': incluir_4,
+                'incluir_5': incluir_5,
+                'numero_perguntas': numero_perguntas,
+                'incluir_analises_perspectivas': incluir_analises_perspectivas,
+                'incluir_falacias': incluir_falacias,
+                'jung': jung,
+                'arquetipoJungFile': arquetipoJungFile,
+                'eneagramaFile': eneagramaFile,
+                'divindades': divindades,
+                'incluir_divindades': incluir_divindades,  # Argumento adicionado
+                'pensadores': pensadores  # Argumento adicionado
+            }
+        )
+        processes.append(process)
+        process.start()
+
+    # Aguardar a conclusão de todos os processos
+    for process in processes:
+        process.join()
+
+    print("Removendo arquivos de progresso se existirem.")
+    for idioma_atual in g_idiomas:
+        progresso_path = progresso_paths[idioma_atual]
+        if os.path.exists(progresso_path):
+            print(f"{timestamp} - Removendo arquivo de progresso: {progresso_path}")
+            os.remove(progresso_path)
+
+    print("Processo concluído. Encerrando o programa.")
+    sys.exit()  # Encerra o programa após terminar
+
+
+if __name__ == "__main__":
+    main()
